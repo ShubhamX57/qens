@@ -1,0 +1,16 @@
+.venv/
+venv/
+env/
+bin/
+lib/
+share/
+pyvenv.cfg
+__pycache__/
+*.csv
+*.gif
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+.env
+*.txt
+*.nxspe
+*.json
