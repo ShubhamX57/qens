@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/qens_logo.svg" width="480" alt="QENS Logo"/>
+  <img src="https://github.com/ShubhamX57/qens.git/qens/main/assets/qens_logo.svg" width="480" alt="QENS Logo"/>
 </p>
 
 # qens — Quasi-Elastic Neutron Scattering Analysis
