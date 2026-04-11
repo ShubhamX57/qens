@@ -1,26 +1,80 @@
-<style>
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
-  }
-  @keyframes spin {
-    from { transform: rotate(0deg); }
-    to { transform: rotate(360deg); }
-  }
-  @keyframes dash {
-    to { stroke-dashoffset: -20; }
-  }
+<svg width="100%" viewBox="0 0 680 268" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>QENS – Quasi-Elastic Neutron Scattering library logo</title>
+<defs>
+  <clipPath id="ec">
+    <circle cx="150" cy="132" r="94"/>
+  </clipPath>
+  <style>
+    @keyframes pulse {
+      0%,100%{opacity:1} 50%{opacity:0.35}
+    }
+    @keyframes spin {
+      from{transform:rotate(0deg)} to{transform:rotate(360deg)}
+    }
+    @keyframes dash {
+      to{stroke-dashoffset:-14}
+    }
+    #o1{transform-origin:150px 132px;animation:spin 9s linear infinite}
+    #o2{transform-origin:150px 132px;animation:spin 9s linear infinite reverse}
+    #o3{transform-origin:150px 132px;animation:spin 14s linear infinite}
+    #nucleus{animation:pulse 2s ease-in-out infinite}
+    #beam{animation:dash 0.9s linear infinite}
+    #a1{animation:pulse 2.2s ease-in-out infinite 0s}
+    #a2{animation:pulse 2.2s ease-in-out infinite 0.25s}
+    #a3{animation:pulse 2.2s ease-in-out infinite 0.5s}
+    #a4{animation:pulse 2.2s ease-in-out infinite 0.75s}
+  </style>
+</defs>
 
-  #orbit1 { transform-origin: 150px 132px; animation: spin 8s linear infinite; }
-  #orbit2 { transform-origin: 150px 132px; animation: spin 8s linear infinite reverse; }
-  #orbit3 { transform-origin: 150px 132px; animation: spin 12s linear infinite; }
+<!-- Emblem background -->
+<circle cx="150" cy="132" r="96" fill="#040b1a"/>
+<circle cx="150" cy="132" r="97.5" fill="none" stroke="#00c6f0" stroke-width="2.2"/>
+<circle cx="150" cy="132" r="84" fill="none" stroke="#0c3b5e" stroke-width="0.6" stroke-dasharray="2 5"/>
 
-  #nucleus-outer { animation: pulse 2s ease-in-out infinite; }
+<!-- Lattice dots -->
+<g fill="#1b5a88" opacity="0.3" clip-path="url(#ec)">
+  <circle cx="130" cy="112" r="1.7"/><circle cx="150" cy="112" r="1.7"/><circle cx="170" cy="112" r="1.7"/><circle cx="190" cy="112" r="1.7"/><circle cx="110" cy="112" r="1.7"/>
+  <circle cx="110" cy="132" r="1.7"/><circle cx="130" cy="132" r="1.7"/><circle cx="170" cy="132" r="1.7"/><circle cx="190" cy="132" r="1.7"/><circle cx="210" cy="132" r="1.7"/>
+  <circle cx="130" cy="152" r="1.7"/><circle cx="150" cy="152" r="1.7"/><circle cx="170" cy="152" r="1.7"/><circle cx="190" cy="152" r="1.7"/><circle cx="110" cy="152" r="1.7"/>
+  <circle cx="130" cy="92" r="1.7"/><circle cx="150" cy="92" r="1.7"/><circle cx="170" cy="92" r="1.7"/>
+  <circle cx="130" cy="172" r="1.7"/><circle cx="150" cy="172" r="1.7"/><circle cx="170" cy="172" r="1.7"/>
+  <circle cx="90" cy="132" r="1.7"/><circle cx="90" cy="112" r="1.7"/><circle cx="90" cy="152" r="1.7"/>
+  <circle cx="210" cy="112" r="1.7"/><circle cx="210" cy="152" r="1.7"/>
+</g>
 
-  #beam { animation: dash 0.8s linear infinite; }
+<!-- Scattering wave arcs -->
+<g clip-path="url(#ec)" fill="none">
+  <path id="a1" d="M 167.3,122 A 20,20 0 0,0 132.7,122" stroke="#00e2ff" stroke-width="1.8"/>
+  <path id="a2" d="M 180.3,114.5 A 35,35 0 0,0 119.7,114.5" stroke="#00c4e8" stroke-width="1.5" opacity="0.78"/>
+  <path id="a3" d="M 193.3,107 A 50,50 0 0,0 106.7,107" stroke="#009cc2" stroke-width="1.2" opacity="0.58"/>
+  <path id="a4" d="M 206.3,99.5 A 65,65 0 0,0 93.7,99.5" stroke="#006e96" stroke-width="1" opacity="0.4"/>
+</g>
 
-  #arc1 { animation: pulse 2s ease-in-out infinite; }
-  #arc2 { animation: pulse 2s ease-in-out infinite 0.2s; }
-  #arc3 { animation: pulse 2s ease-in-out infinite 0.4s; }
-  #arc4 { animation: pulse 2s ease-in-out infinite 0.6s; }
-</style>
+<!-- Orbital ellipses -->
+<g fill="none" clip-path="url(#ec)">
+  <ellipse id="o1" cx="150" cy="132" rx="80" ry="22" stroke="#10568a" stroke-width="1.3"/>
+  <ellipse id="o2" cx="150" cy="132" rx="80" ry="22" stroke="#10568a" stroke-width="1.3" transform="rotate(60 150 132)"/>
+  <ellipse id="o3" cx="150" cy="132" rx="80" ry="22" stroke="#10568a" stroke-width="1.3" transform="rotate(-60 150 132)"/>
+</g>
+
+<!-- Incoming beam -->
+<line id="beam" x1="53" y1="132" x2="143" y2="132" stroke="#00bfea" stroke-width="1.1" stroke-dasharray="4 3" opacity="0.52" clip-path="url(#ec)"/>
+
+<!-- Nucleus -->
+<circle id="nucleus" cx="150" cy="132" r="8" fill="#006a9c" opacity="0.5"/>
+<circle cx="150" cy="132" r="6" fill="#00bbec"/>
+<circle cx="150" cy="132" r="3.5" fill="#d8f4ff"/>
+
+<!-- Particle dots -->
+<circle cx="206" cy="116" r="3.8" fill="#00b4e0" clip-path="url(#ec)"/>
+<circle cx="192" cy="173" r="3.8" fill="#00b4e0" clip-path="url(#ec)"/>
+<circle cx="165" cy="75" r="3.8" fill="#00b4e0" clip-path="url(#ec)"/>
+
+<!-- Scattered trail -->
+<path d="M 155,124 C 177,108 198,90 216,75" stroke="#00d4f8" stroke-width="1.1" fill="none" opacity="0.42" stroke-dasharray="3 2.5" clip-path="url(#ec)"/>
+
+<!-- QENS wordmark -->
+<text x="270" y="176" font-family="'Helvetica Neue',Arial,sans-serif" font-size="96" font-weight="700" fill="#e6f4ff" letter-spacing="6">QENS</text>
+<line x1="270" y1="186" x2="548" y2="186" stroke="#123f5c" stroke-width="0.9"/>
+<text x="270" y="206" font-family="'Helvetica Neue',Arial,sans-serif" font-size="12.5" font-weight="400" fill="#4ea4c0" letter-spacing="2.4">QUASI-ELASTIC NEUTRON SCATTERING</text>
+</svg>
