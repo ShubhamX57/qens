@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/ShubhamX57/qens/main/assets/qens_logo.svg" width="680" alt="QENS Logo"/>
+  <img src="https://raw.githubusercontent.com/ShubhamX57/qens/main/assets/qens_logo.svg" width="990" alt="QENS Logo"/>
 </p>
 
 
