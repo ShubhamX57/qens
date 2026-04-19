@@ -1,421 +1,339 @@
 """
-io.py — Read ISIS Mantid .nxspe (NeXus HDF5) files
-====================================================
+models.py — Diffusion models and spectral basis construction
+=============================================================
 
-.nxspe files are NeXus HDF5 archives produced by the ISIS Mantid data
-reduction pipeline.  They contain the reduced S(Q, ω) data — counts, errors,
-and detector geometry — for a single spectrometer run.
+This module contains:
 
-File naming convention (ISIS)
-------------------------------
-    <sample>_<temp>_<Ei×100>_<kind>.nxspe
+1. Physical model functions that predict the quasi-elastic linewidth Γ(Q):
+   - ``ce``       : Chudley-Elliott jump diffusion
+   - ``fickian``  : Simple Fickian (continuous) diffusion
+   - ``ss_model`` : Singwi-Sjölander jump diffusion
 
-Example: ``benzene_290_360_inc.nxspe``
-    sample = benzene
-    temp   = 290 K
-    Ei     = 360 / 100 = 3.60 meV
-    kind   = inc (incoherent scattering)
+2. Spectral line-shape functions:
+   - ``lorentz``  : Normalised Lorentzian  (quasi-elastic component)
+   - ``gnorm``    : Normalised Gaussian    (resolution / elastic component)
 
-HDF5 tree (typical structure)
-------------------------------
-The structure varies between ISIS instruments, so ``_read_polar`` tries
-several candidate paths for the detector angles.  Typical layout:
+3. The NNLS basis matrix builder:
+   - ``make_basis``: Constructs the [elastic | quasi-elastic | background]
+                     matrix used in the Bayesian likelihood.
 
-    entry1/
-        NXSPE_info/
-            efixed          (float scalar — incident energy Ei in meV)
-        data/
-            energy          (array, N+1 energy bin edges in meV)
-            data            (2D array, shape [n_det, N_energy])
-            error           (2D array, shape [n_det, N_energy])
-            polar           (1D array, shape [n_det], scattering angles in deg)
+Physical context
+----------------
+The measured spectrum at each Q is modelled as:
+
+    S_obs(Q, ω) = a_el · R(ω) + a_ql · [L(ω, Γ) ⊗ R(ω)] + bg
+
+where
+    R(ω)  = Gaussian resolution function with width sigma_res
+    L(ω)  = Lorentzian with half-width Γ = ce(Q, D, l)
+    ⊗      = convolution in energy
+    a_el, a_ql, bg = non-negative amplitudes solved by NNLS
+
+The convolution of L with R is essential — the instrument always smears the
+true quasi-elastic signal.  This follows directly from the Van Hove formalism:
+    S_obs = S_true ⊗ R(ω).
+
+Model selection guide
+---------------------
+Use Fickian when Γ(Q) is linear in Q² across your entire Q-range.
+Use CE (Chudley-Elliott) when you see saturation of Γ at high Q — this is
+the fingerprint of jump diffusion.
+Use SS (Singwi-Sjölander) as an alternative jump model; it has a different
+crossover shape but the same low- and high-Q limits as CE.
 """
 
 from __future__ import annotations
 
-import os
 import numpy as np
+from scipy.signal import fftconvolve
 
-from .constants import mn, hbar, mev_j
+from .constants import hbar_mevps
+
+# Minimum allowed Lorentzian HWHM (meV).  Used as a floor to prevent
+# numerical issues when D or l approaches zero.
+_GAMMA_FLOOR = 1e-5
 
 
-# ── Diagnostic helper ─────────────────────────────────────────────────────────
+# ── Diffusion model functions ─────────────────────────────────────────────────
 
-def inspect_nxspe(path: str) -> None:
+def ce(q, d, l):
     """
-    Print the full HDF5 tree of a .nxspe file to stdout.
+    Chudley-Elliott jump diffusion HWHM.
 
-    Useful for diagnosing files from instruments whose internal structure
-    differs from the expected layout.
+    Predicts the half-width at half-maximum (HWHM) of the quasi-elastic
+    Lorentzian for a molecule undergoing discrete jump diffusion: the molecule
+    sits at a lattice site for mean time τ = l²/(6D) then jumps to a
+    neighbouring site a distance l away.
+
+    The formula is derived by Fourier-transforming the jump probability over
+    an isotropic (spherical) distribution of jump directions:
+
+        Γ(Q) = (ħ / τ) · [1 − sinc(Ql / π)]
+
+    where sinc(x) = sin(πx) / (πx) (NumPy normalised convention).
+
+    Limiting behaviour
+    ------------------
+    Low Q  (Ql → 0) : sinc → 1 − (Ql)²/6, so Γ(Q) ≈ ħ·D·Q²  (Fickian limit)
+    High Q (Ql → ∞): sinc → 0,             so Γ(Q) → ħ/τ = constant
+
+    The saturation of Γ at high Q is the experimental fingerprint of jump
+    diffusion.  For benzene at 290 K, saturation starts around Q* ≈ π/l ≈ 1.5
+    Å⁻¹, which falls within the MARI measurement window.
 
     Parameters
     ----------
-    path : str
-        Path to the .nxspe file.
-
-    Raises
-    ------
-    ImportError
-        If h5py is not installed.
-    """
-    try:
-        import h5py
-    except ImportError:
-        raise ImportError("h5py required: pip install h5py")
-
-    print(f"HDF5 tree: {path}")
-    print("-" * 60)
-
-    def _visitor(name, obj):
-        """h5py visitor callback — prints name, shape and dtype of each node."""
-        indent = "  " * name.count("/")
-        leaf   = name.split("/")[-1]
-        if hasattr(obj, "shape"):
-            # Dataset node — show shape and dtype
-            print(f"{indent}{leaf}  shape={obj.shape}  dtype={obj.dtype}")
-        else:
-            # Group node — just print the name
-            print(f"{indent}{leaf}/")
-
-    with h5py.File(path, "r") as hf:
-        hf.visititems(_visitor)
-
-    print("-" * 60)
-
-
-# ── Single-file reader ────────────────────────────────────────────────────────
-
-def read_nxspe(path: str) -> dict:
-    """
-    Load a single .nxspe file into a dataset dictionary.
-
-    Performs the following steps in order:
-    1. Parse metadata (temp, Ei, kind) from the filename.
-    2. Open the HDF5 file and read energy edges, counts, errors, angles.
-    3. Compute energy bin centres from edges.
-    4. Compute Q per detector from Ei and scattering angle (elastic approx.).
-    5. Identify good detectors (> 50% of channels are positive and finite).
-    6. Return a dict containing all arrays needed downstream.
-
-    Elastic approximation for Q
-    ----------------------------
-    Q = 2 · ki · sin(θ), where ki = √(2·mn·Ei) / ħ and θ = two_theta / 2.
-    This assumes the neutron wavevector does not change on scattering —
-    valid for QENS where |ω| ≪ Ei.
-
-    Good detector selection
-    -----------------------
-    A detector is marked good if more than half its energy channels contain
-    positive, finite counts.  Dead, masked, or mostly-zero detectors are
-    excluded.  All downstream functions operate on data[good] rather than
-    data, so dead detectors never contaminate averaged spectra.
-
-    Parameters
-    ----------
-    path : str
-        Absolute or relative path to the .nxspe file.
+    q : array-like
+        Momentum transfer values (Å⁻¹).
+    d : float
+        Self-diffusion coefficient (Å²/ps).  Must be > 0.
+    l : float
+        Mean jump length (Å).  Absolute value is taken internally.
 
     Returns
     -------
-    dict with keys:
-        name     : str     — basename of the file
-        temp     : int     — sample temperature (K)
-        ei       : float   — incident energy (meV)
-        kind     : str     — "inc" or "coh"
-        e_raw    : ndarray — energy bin centres before elastic peak correction
-        e        : ndarray — copy of e_raw (will be shifted by fit_elastic_peak)
-        data     : ndarray — S(Q, ω), shape (n_det, N_energy)
-        errs     : ndarray — statistical errors, shape (n_det, N_energy)
-        good     : ndarray — 1D int array of usable detector indices
-        q        : ndarray — momentum transfer per detector (Å⁻¹)
-        format   : str     — "hdf5"
-
-    Raises
-    ------
-    FileNotFoundError
-        If the file does not exist at the given path.
-    ImportError
-        If h5py is not installed.
-    ValueError
-        If the filename does not follow the ISIS naming convention, or if no
-        usable detectors are found.
-    """
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"File not found: {path}")
-
-    try:
-        import h5py
-    except ImportError:
-        raise ImportError("h5py required: pip install h5py")
-
-    # ── Parse filename metadata ───────────────────────────────────────────────
-    name  = os.path.basename(path)
-    parts = name.replace(".nxspe", "").split("_")
-
-    if len(parts) < 4:
-        raise ValueError(
-            f"Filename '{name}' does not match expected pattern "
-            f"<sample>_<temp>_<Ei×100>_<kind>"
-        )
-
-    try:
-        temp = int(parts[1])   # temperature in Kelvin
-    except ValueError:
-        raise ValueError(f"Cannot parse temperature from '{name}'")
-
-    kind = parts[3]  # "inc" (incoherent) or "coh" (coherent)
-
-    # ── Read HDF5 content ─────────────────────────────────────────────────────
-    with h5py.File(path, "r") as hf:
-        # The top-level entry key varies by instrument (e.g. "entry1", "mantid_workspace_1")
-        entry_key = next(iter(hf.keys()))
-        entry     = hf[entry_key]
-
-        # Incident energy — try HDF5 metadata first, fall back to filename
-        ei = _read_ei(entry, parts)
-
-        # Energy axis: file stores bin *edges*, not centres
-        energy_edges = np.asarray(entry["data"]["energy"], dtype=float)
-        # Midpoints give N-1 energy points from N edges
-        e_raw = 0.5 * (energy_edges[:-1] + energy_edges[1:])
-
-        # Spectral data and errors, shape (n_det, N_energy)
-        data = np.asarray(entry["data"]["data"],  dtype=float)
-        errs = np.asarray(entry["data"]["error"], dtype=float)
-
-        # Scattering angles per detector (degrees)
-        two_theta_det = _read_polar(entry, path)
-
-    # ── Clean non-finite values ───────────────────────────────────────────────
-    # Replace NaN/Inf in data with 0 (they appear in masked detectors)
-    data = np.where(np.isfinite(data),              data, 0.0)
-    # Replace non-positive or non-finite errors with 0 (handled downstream)
-    errs = np.where(np.isfinite(errs) & (errs > 0), errs, 0.0)
-
-    # ── Good detector mask ────────────────────────────────────────────────────
-    # A detector is usable if more than half its energy channels have positive,
-    # finite counts.  This excludes dead detectors and masked regions.
-    good_mask = (
-        np.sum((data > 0) & np.isfinite(data), axis=1) > data.shape[1] // 2
-    )
-    good = np.where(good_mask)[0]  # integer index array
-
-    if good.size == 0:
-        raise ValueError(f"No usable detectors found in '{name}'")
-
-    # ── Q per detector (elastic approximation) ────────────────────────────────
-    # ki in Å⁻¹: ki = sqrt(2 * mn * Ei_J) / hbar * 1e-10
-    ki = np.sqrt(2 * mn * ei * mev_j) / hbar * 1e-10
-    # Q = 2 ki sin(theta),  theta = two_theta / 2
-    q  = 2 * ki * np.sin(np.radians(two_theta_det / 2))
-
-    return dict(
-        name   = name,
-        temp   = temp,
-        ei     = ei,
-        kind   = kind,
-        e_raw  = e_raw,
-        e      = e_raw.copy(),  # will be shifted in fit_elastic_peak
-        data   = data,
-        errs   = errs,
-        good   = good,
-        q      = q,
-        format = "hdf5",
-    )
-
-
-# Alias for backwards compatibility
-read_nxspe_hdf5 = read_nxspe
-
-
-# ── Private helpers ───────────────────────────────────────────────────────────
-
-def _read_ei(entry, filename_parts: list[str]) -> float:
-    """
-    Extract the incident energy Ei (meV) from an open HDF5 entry.
-
-    Tries two common key names in NXSPE_info first, then falls back to
-    parsing Ei from the filename (third underscore-separated token × 100).
-
-    Parameters
-    ----------
-    entry : h5py.Group
-        The top-level entry group of the .nxspe file.
-    filename_parts : list of str
-        Filename split on underscores (without extension).
-
-    Returns
-    -------
-    float
-        Incident energy in meV.
+    numpy.ndarray
+        HWHM Γ(Q) in meV, same shape as q.
 
     Raises
     ------
     ValueError
-        If Ei cannot be determined from either the HDF5 metadata or filename.
+        If d ≤ 0.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from qens.models import ce
+    >>> q = np.linspace(0.3, 2.5, 10)
+    >>> gamma = ce(q, D=0.32, l=2.1)  # meV
     """
-    # Try standard NeXus NXSPE_info keys
-    for key in ("efixed", "fixed_energy"):
-        try:
-            return float(entry["NXSPE_info"][key][()])
-        except (KeyError, TypeError):
-            pass
+    if d <= 0:
+        raise ValueError(f"d must be > 0, got {d}")
 
-    # Fall back to filename convention: <sample>_<temp>_<Ei×100>_<kind>
-    try:
-        return int(filename_parts[2]) / 100.0
-    except (ValueError, IndexError):
-        raise ValueError(
-            "Cannot determine Ei from HDF5 metadata or filename.  "
-            "Check NXSPE_info/efixed or the filename format."
-        )
+    l = abs(l)  # l is always positive — take abs to guard against sampler sign flips
+
+    # Residence time between jumps (ps)
+    tau = l**2 / (6 * d)
+
+    # NumPy sinc is the *normalised* sinc: sinc(x) = sin(πx)/(πx).
+    # So sinc(q*l/π) = sin(q*l) / (q*l), which is the spherical average
+    # of exp(iQ·r) over jump vectors of length l.
+    return (hbar_mevps / tau) * (1 - np.sinc(np.asarray(q) * l / np.pi))
 
 
-def _read_polar(entry, path: str) -> np.ndarray:
+def fickian(q, d):
     """
-    Extract the polar (scattering) angles (degrees) for each detector.
+    Fickian (continuous) diffusion HWHM.
 
-    Different ISIS instruments write this array to different HDF5 paths.
-    The function tries a prioritised list of candidate locations and falls
-    back to azimuthal angles as a last resort (with a warning).
+    In the limit of infinitesimally small, continuous jumps the Chudley-Elliott
+    model reduces to Fick's law:
+
+        Γ(Q) = ħ · D · Q²
+
+    This is a straight line through the origin when plotted against Q².  Any
+    measured data that curves or saturates at high Q is evidence of jump
+    diffusion (use CE or SS instead).
 
     Parameters
     ----------
-    entry : h5py.Group
-        The top-level entry group of the .nxspe file.
-    path : str
-        Full file path — used only in the error message.
+    q : array-like
+        Momentum transfer values (Å⁻¹).
+    d : float
+        Self-diffusion coefficient (Å²/ps).
 
     Returns
     -------
-    numpy.ndarray, shape (n_det,)
-        Polar (two-theta) angles in degrees for each detector.
+    numpy.ndarray
+        HWHM Γ(Q) in meV, same shape as q.
+    """
+    return hbar_mevps * d * np.asarray(q)**2
+
+
+def ss_model(q, d, tau_s):
+    """
+    Singwi-Sjölander jump diffusion HWHM.
+
+    An alternative jump-diffusion model that assumes exponentially distributed
+    waiting times between jumps (a continuous-time random walk), rather than
+    a fixed lattice geometry as in CE:
+
+        Γ(Q) = ħ · D · Q² / (1 + D · Q² · τ_s)
+
+    Limiting behaviour
+    ------------------
+    Low Q  : Γ ≈ ħ·D·Q²          (same Fickian limit as CE)
+    High Q : Γ → ħ / τ_s          (same saturation as CE, different crossover)
+
+    For benzene at the Q-range accessible on MARI, CE and SS give
+    statistically indistinguishable fits.  Prefer SS on physical grounds for
+    liquids with no long-range lattice order.
+
+    Parameters
+    ----------
+    q : array-like
+        Momentum transfer values (Å⁻¹).
+    d : float
+        Self-diffusion coefficient (Å²/ps).
+    tau_s : float
+        Residence time between jumps (ps).
+
+    Returns
+    -------
+    numpy.ndarray
+        HWHM Γ(Q) in meV, same shape as q.
+    """
+    q = np.asarray(q)
+    return hbar_mevps * d * q**2 / (1 + d * q**2 * tau_s)
+
+
+# ── Spectral line-shape functions ─────────────────────────────────────────────
+
+def lorentz(w, gamma):
+    """
+    Normalised Lorentzian line shape (area = 1).
+
+    The quasi-elastic component of a QENS spectrum is a Lorentzian in energy
+    transfer ω whose half-width Γ encodes the timescale of atomic motion.
+    Before being added to the model, it is convolved with the resolution
+    Gaussian in ``make_basis``.
+
+    Formula:
+        L(ω, Γ) = (1/π) · Γ / (ω² + Γ²)
+
+    Parameters
+    ----------
+    w : array-like
+        Energy transfer values (meV).
+    gamma : float
+        Half-width at half-maximum (meV).  Clamped to _GAMMA_FLOOR if below it.
+
+    Returns
+    -------
+    numpy.ndarray
+        Lorentzian values in meV⁻¹, same shape as w.  Integrates to 1 over ω.
+    """
+    # Guard against gamma = 0 (would cause division by zero and a delta function)
+    gamma = max(float(gamma), _GAMMA_FLOOR)
+    w = np.asarray(w, dtype=float)
+    return (1 / np.pi) * gamma / (w**2 + gamma**2)
+
+
+def gnorm(w, sigma):
+    """
+    Normalised Gaussian line shape (area = 1).
+
+    Used as the instrument resolution function R(ω).  The Gaussian
+    approximation is valid for most time-of-flight spectrometers near the
+    elastic line.
+
+    Formula:
+        G(ω, σ) = exp(−ω²/(2σ²)) / (σ√(2π))
+
+    Parameters
+    ----------
+    w : array-like
+        Energy transfer values (meV).
+    sigma : float
+        Standard deviation of the Gaussian (meV).
+        Relates to FWHM by: FWHM = 2.355 · sigma.
+
+    Returns
+    -------
+    numpy.ndarray
+        Gaussian values in meV⁻¹, same shape as w.  Integrates to 1 over ω.
 
     Raises
     ------
     ValueError
-        If no suitable angle array is found anywhere in the file.
+        If sigma ≤ 0.
     """
-    # Ordered list of (group_path, dataset_name) pairs to try
-    candidates = [
-        ("data",                  "polar"),         # most common
-        ("instrument/detector",   "polar"),          # some instruments
-        ("instrument/detector_1", "polar_angle"),    # MAPS-style
-    ]
-
-    for grp_path, ds_name in candidates:
-        try:
-            grp = entry
-            # Navigate the group path step by step
-            for part in grp_path.split("/"):
-                grp = grp[part]
-            arr = np.asarray(grp[ds_name], dtype=float)
-            # Sanity check: must be 1D and non-empty
-            if arr.ndim == 1 and arr.size > 0:
-                return arr
-        except (KeyError, TypeError):
-            continue  # path doesn't exist in this file — try the next one
-
-    # Last resort: azimuthal angles are sometimes a proxy for polar on
-    # instruments where the two-theta geometry is arranged azimuthally
-    try:
-        arr = np.asarray(entry["data"]["azimuthal"], dtype=float)
-        if arr.ndim == 1 and arr.size > 0:
-            import warnings
-            warnings.warn(
-                "Using azimuthal angles as a proxy for polar angles.  "
-                "Q values may be approximate.",
-                UserWarning,
-                stacklevel=2,
-            )
-            return arr
-    except (KeyError, TypeError):
-        pass
-
-    raise ValueError(
-        f"Cannot locate polar detector angles in '{os.path.basename(path)}'.  "
-        f"Tried: {[c[1] for c in candidates]} and data/azimuthal.  "
-        f"Run inspect_nxspe() to see the full HDF5 tree."
-    )
+    if sigma <= 0:
+        raise ValueError(f"sigma must be > 0, got {sigma}")
+    w = np.asarray(w, dtype=float)
+    return np.exp(-0.5 * (w / sigma)**2) / (sigma * np.sqrt(2 * np.pi))
 
 
-# ── Multi-file loader ─────────────────────────────────────────────────────────
+# ── NNLS basis matrix ─────────────────────────────────────────────────────────
 
-def load_dataset(
-    file_list: list[str],
-    data_dir: str = ".",
-    critical_files: list[str] | None = None,
-) -> dict:
+def make_basis(e_grid, q_val, d, l, sigma_res):
     """
-    Load multiple .nxspe files into a single dataset dictionary.
+    Build the three-column basis matrix for NNLS spectral decomposition.
 
-    Iterates over file_list, calling ``read_nxspe`` on each file found in
-    data_dir.  Files that are missing or fail to load are skipped unless they
-    appear in critical_files, in which case an exception is raised.
+    At a given (D, l), the observed spectrum at momentum transfer q_val is
+    modelled as a non-negative combination of three components:
+
+        S_obs ≈ a_el · col0  +  a_ql · col1  +  bg · col2
+
+    Column layout
+    -------------
+    col0 : Elastic component
+        Gaussian at the resolution width sigma_res, normalised to peak = 1.
+        Represents scattering that does not involve energy transfer — atoms
+        that are stationary on the timescale of the measurement.
+
+    col1 : Quasi-elastic component
+        Lorentzian with HWHM = ce(q_val, d, l), convolved with the resolution
+        Gaussian, normalised to peak = 1.
+        The convolution is physically required: the instrument always smears
+        the true quasi-elastic signal.
+
+    col2 : Flat background
+        A vector of ones, capturing any incoherent or multiple-scattering
+        background that is flat in energy over the fitting window.
+
+    Normalisation
+    -------------
+    Both col0 and col1 are divided by their peak value.  Without this, a very
+    broad (flat) Lorentzian would have column values orders of magnitude
+    smaller than the elastic column, and NNLS would effectively ignore it.
+    Normalising to unity puts both components on the same scale so that the
+    amplitudes (a_el, a_ql) directly represent physical fractions.
 
     Parameters
     ----------
-    file_list : list of str
-        Filenames to load (basenames only; data_dir is prepended).
-    data_dir : str
-        Directory containing the .nxspe files.  Default: current directory.
-    critical_files : list of str or None
-        Subset of file_list that must load successfully.  A missing or
-        unreadable critical file raises an exception rather than being skipped.
-        If None, all failures are non-fatal.
+    e_grid : numpy.ndarray
+        Energy transfer axis of the data (meV), uniformly spaced.
+    q_val : float
+        Momentum transfer for this Q-bin (Å⁻¹).
+    d : float
+        Diffusion coefficient trial value (Å²/ps).
+    l : float
+        Jump length trial value (Å).
+    sigma_res : float
+        Instrument resolution sigma (meV).
 
     Returns
     -------
-    dict
-        Mapping of filename → dataset dict (as returned by ``read_nxspe``).
-        Only successfully loaded files appear as keys.
-
-    Raises
-    ------
-    FileNotFoundError
-        If a critical file is missing from data_dir.
-    RuntimeError
-        If no files in file_list could be loaded at all.
+    numpy.ndarray, shape (len(e_grid), 3)
+        Basis matrix [elastic | quasi-elastic | background].
+        Pass directly to ``scipy.optimize.nnls``.
 
     Notes
     -----
-    The returned dict is used by downstream functions as:
-        dataset[cfg.primary_file]  → main warm-sample dataset
+    dt = e_grid[1] − e_grid[0] is applied after fftconvolve to preserve the
+    physical normalisation of the convolution (converts the discrete sum to an
+    integral approximation).
     """
-    if critical_files is None:
-        critical_files = []
+    # Energy step — needed to normalise the convolution to unit integral
+    dt = e_grid[1] - e_grid[0]
 
-    dataset = {}
+    # Quasi-elastic HWHM from the CE model at this Q value.
+    # Clamped to _GAMMA_FLOOR to avoid numerical issues at very small D or l.
+    gamma = max(float(ce(q_val, d, l)), _GAMMA_FLOOR)
 
-    for fname in file_list:
-        full_path = os.path.join(data_dir, fname)
+    # ── Elastic column (col0) ─────────────────────────────────────────────────
+    # Resolution Gaussian centred at ω = 0.  Normalised to peak = 1 so that
+    # the amplitude a_el directly represents the elastic fraction.
+    el = gnorm(e_grid, sigma_res)
+    el /= el.max() if el.max() > 0 else 1.0
 
-        # ── File existence check ──────────────────────────────────────────────
-        if not os.path.exists(full_path):
-            if fname in critical_files:
-                raise FileNotFoundError(f"Critical file missing: {fname}")
-            print(f"  skipping (not found): {fname}")
-            continue
+    # ── Quasi-elastic column (col1) ───────────────────────────────────────────
+    # Lorentzian of width gamma, convolved with the resolution Gaussian.
+    # fftconvolve returns a discrete convolution; multiplying by dt converts
+    # it to a proper integral approximation.
+    ql = fftconvolve(lorentz(e_grid, gamma), gnorm(e_grid, sigma_res), mode="same") * dt
+    ql /= ql.max() if ql.max() > 0 else 1.0
 
-        # ── Attempt to load ───────────────────────────────────────────────────
-        try:
-            d = read_nxspe(full_path)
-            dataset[fname] = d
-            print(
-                f"  loaded [hdf5]: {fname}  "
-                f"Ei={d['ei']:.2f} meV  "
-                f"T={d['temp']} K  "
-                f"good={len(d['good'])} det"
-            )
-        except Exception as exc:
-            if fname in critical_files:
-                raise  # re-raise for critical files
-            print(f"  failed to load {fname}: {exc}")
-
-    if not dataset:
-        raise RuntimeError(
-            "No files loaded successfully.  "
-            "Check data_dir and file_list in Config."
-        )
-
-    return dataset
+    # ── Assemble and return ───────────────────────────────────────────────────
+    # column_stack produces shape (N_energy, 3)
+    return np.column_stack([el, ql, np.ones(len(e_grid))])
